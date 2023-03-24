@@ -33,8 +33,20 @@ from mthree.norms import ainv_onenorm_est_lu, ainv_onenorm_est_iter
 from mthree.matvec import M3MatVec
 from mthree.exceptions import M3Error
 from mthree.classes import QuasiCollection
-from ._helpers import system_info
 
+
+def get_counts(result, num_qbits):
+    shots = result.metadata[0]['shots']
+    quasi_dists = result.quasi_dists
+    counts = []
+    for qd in quasi_dists:
+        d = {}
+        for k, v in qd.items():
+            k = bin(k)[2:].zfill(num_qbits)
+            v = int(v * shots)
+            d[k] = v
+        counts.append(d)
+    return counts
 
 class M3Mitigation():
     """Main M3 calibration class."""
@@ -48,15 +60,13 @@ class M3Mitigation():
 
         Attributes:
             system (Backend): The target system.
-            system_info (dict): Information needed about the system
-            cal_method (str): Calibration method used
-            cal_timestamp (str): Time at which cals were taken
             single_qubit_cals (list): 1Q calibration matrices
         """
+        self.sampler = system
+        system = system.backend
         self.system = system
-        self.system_info = system_info(system) if system else {}
         self.single_qubit_cals = None
-        self.num_qubits = self.system_info["num_qubits"] if system else None
+        self.num_qubits = system.configuration().num_qubits if system else None
         self.iter_threshold = iter_threshold
         self.cal_shots = None
         self.cal_method = 'balanced'
@@ -65,8 +75,6 @@ class M3Mitigation():
         # attributes for handling threaded job
         self._thread = None
         self._job_error = None
-        # Holds the cals file
-        self.cals_file = None
 
     def __getattribute__(self, attr):
         """This allows for checking the status of the threaded cals call
@@ -139,7 +147,7 @@ class M3Mitigation():
                               rep_delay=rep_delay,
                               cals_file=cals_file)
 
-    def cals_from_system(self, qubits=None, shots=None, method=None,
+    def cals_from_system(self, qubits=None, shots=None, method='balanced',
                          initial_reset=False, rep_delay=None, cals_file=None,
                          async_cal=False):
         """Grab calibration data from system.
@@ -147,8 +155,7 @@ class M3Mitigation():
         Parameters:
             qubits (array_like): Qubits over which to correct calibration data. Default is all.
             shots (int): Number of shots per circuit. min(1e4, max_shots).
-            method (str): Type of calibration, 'balanced' (default for hardware),
-                         'independent' (default for simulators), or 'marginal'.
+            method (str): Type of calibration, 'balanced' (default), 'independent', or 'marginal'.
             initial_reset (bool): Use resets at beginning of calibration circuits, default=False.
             rep_delay (float): Delay between circuits on IBM Quantum backends.
             cals_file (str): Output path to write JSON calibration data to.
@@ -161,17 +168,14 @@ class M3Mitigation():
             raise M3Error('Calibration currently in progress.')
         if qubits is None:
             qubits = range(self.num_qubits)
-        if method is None:
-            method = 'balanced'
-            if self.system_info["simulator"]:
-                method = 'independent'
         self.cal_method = method
         self.rep_delay = rep_delay
-        self.cals_file = cals_file
         self.cal_timestamp = None
         self._grab_additional_cals(qubits, shots=shots,  method=method,
                                    rep_delay=rep_delay, initial_reset=initial_reset,
                                    async_cal=async_cal)
+        if cals_file:
+            self.cals_to_file(cals_file)
 
     def cals_from_file(self, cals_file):
         """Generated the calibration data from a previous runs output
@@ -213,7 +217,7 @@ class M3Mitigation():
         if not self.single_qubit_cals:
             raise M3Error('Mitigator is not calibrated.')
         save_dict = {'timestamp': self.cal_timestamp,
-                     'backend': self.system_info["name"],
+                     'backend': self.system.name(),
                      'shots': self.cal_shots,
                      'cals': self.single_qubit_cals}
         with open(cals_file, 'wb') as fd:
@@ -278,7 +282,7 @@ class M3Mitigation():
             self.single_qubit_cals = [None]*self.num_qubits
         if self.cal_shots is None:
             if shots is None:
-                shots = min(self.system_info["max_shots"], 10000)
+                shots = min(self.system.configuration().max_shots, 10000)
             self.cal_shots = shots
         if self.rep_delay is None:
             self.rep_delay = rep_delay
@@ -288,14 +292,14 @@ class M3Mitigation():
 
         if isinstance(qubits, dict):
             # Assuming passed a mapping
-            qubits = list(set(qubits.values()))
+            qubits = list(qubits)
         elif isinstance(qubits, list):
             # Check if passed a list of mappings
             if isinstance(qubits[0], dict):
                 # Assuming list of mappings, need to get unique elements
                 _qubits = []
                 for item in qubits:
-                    _qubits.extend(list(set(item.values())))
+                    _qubits.extend(list(item))
                 qubits = list(set(_qubits))
 
         num_cal_qubits = len(qubits)
@@ -322,10 +326,12 @@ class M3Mitigation():
 
         # This Backend check is here for Qiskit direct access.  Should be removed later.
         if not isinstance(self.system, Backend):
+            # job = self.sampler.run(trans_qcs, shots=shots)
             job = execute(trans_qcs, self.system, optimization_level=0,
                           shots=shots, rep_delay=self.rep_delay)
         else:
-            job = self.system.run(trans_qcs, shots=shots, rep_delay=self.rep_delay)
+            job = self.sampler.run(trans_qcs, shots=shots)
+            # job = self.system.run(trans_qcs, shots=shots, rep_delay=self.rep_delay)
 
         # Execute job and cal building in new theread.
         self._job_error = None
@@ -346,7 +352,7 @@ class M3Mitigation():
 
         Parameters:
             counts (dict, list): Input counts dict or list of dicts.
-            qubits (dict, array_like): Qubits on which measurements applied.
+            qubits (array_like): Qubits on which measurements applied.
             distance (int): Distance to correct for. Default=num_bits
             method (str): Solution method: 'auto', 'direct' or 'iterative'.
             max_iter (int): Max. number of iterations, Default=25.
@@ -372,13 +378,13 @@ class M3Mitigation():
 
         if isinstance(qubits, dict):
             # If a mapping was given for qubits
-            qubits = [list(qubits.values())]
+            qubits = [list(qubits)]
         elif not any(isinstance(qq, (list, tuple, np.ndarray, dict)) for qq in qubits):
             qubits = [qubits]*len(counts)
         else:
             if isinstance(qubits[0], dict):
                 # assuming passed a list of mappings
-                qubits = [list(qu.values()) for qu in qubits]
+                qubits = [list(qu) for qu in qubits]
 
         if len(qubits) != len(counts):
             raise M3Error('Length of counts does not match length of qubits.')
@@ -671,9 +677,10 @@ def _job_thread(job, mit, method, qubits, num_cal_qubits, cal_strings):
     except Exception as error:
         mit._job_error = error
         return
-    counts = res.get_counts()
+    counts = get_counts(res, mit.num_qubits)
     # attach timestamp
-    timestamp = res.date
+    import datetime
+    timestamp = datetime.datetime.now()
     # Needed since Aer result date is str but IBMQ job is datetime
     if isinstance(timestamp, datetime.datetime):
         timestamp = timestamp.isoformat()
@@ -753,9 +760,5 @@ def _job_thread(job, mit, method, qubits, num_cal_qubits, cal_strings):
         for idx, cal in enumerate(cals):
             mit.single_qubit_cals[qubits[idx]] = cal
 
-    # save cals to file, if requested
-    if mit.cals_file:
-        mit.cals_to_file(mit.cals_file)
-    # Return list of faulty qubits, if any
     if any(bad_list):
         mit._job_error = M3Error('Faulty qubits detected: {}'.format(bad_list))
